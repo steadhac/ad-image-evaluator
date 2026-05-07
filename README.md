@@ -11,18 +11,14 @@ Automated evaluation of Search Ad images for policy compliance, user experience 
 
 This tool automates the detection of policy violations, UX quality assessment, and audience classification for image-based ad assets — using a single local vision model call per image to return a structured compliance report.
 
-## Why automation over manual review
+## Why use this tool
 
-| | Manual testers | This tool |
-|---|---|---|
-| **Throughput** | Limited by headcount — reviewers handle tens of images per hour | Processes images in parallel, limited only by hardware |
-| **Consistency** | Judgment varies between reviewers and shifts over time | Same policy criteria applied identically on every evaluation |
-| **Coverage** | Full review is cost-prohibitive at scale; sampling is the norm | Every image can be evaluated before it goes live |
-| **Speed** | Review queues introduce hours or days of delay | Results returned in seconds per image |
-| **Structured output** | Findings are unstructured notes; hard to aggregate | Returns machine-readable JSON — violations, scores, and verdicts feed directly into downstream systems |
-| **Cost** | Grows linearly with volume | Runs fully locally — no API costs |
+- **Consistent** — same policy criteria applied identically on every image, no reviewer drift
+- **Fast** — results in seconds per image, no review queues
+- **Scalable** — evaluate every image before it goes live, not just a sample
+- **Free to run** — fully local, no API costs regardless of volume
+- **Actionable output** — structured JSON feeds directly into downstream systems, dashboards, or ticketing
 
-Manual review remains valuable for edge cases and policy calibration. Automated evaluation handles routine volume, flags candidates for human escalation, and keeps review effort focused where judgment actually matters.
 
 ## What it evaluates
 
