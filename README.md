@@ -43,7 +43,7 @@ Classifies the image as appropriate or not for: Under 13 / 13–17 / 18+ / All A
 
 ## How it works
 
-A single Ollama vision model call analyzes the image and returns structured JSON covering all three evaluation areas. The overall verdict is **FAIL** if any HIGH severity violation is detected, **PASS** otherwise.
+Two focused model calls are made per image — one for policy violations, one for UX and audience. Keeping them separate gives the model a narrower task each time and produces more accurate results. The overall verdict is computed from the violations result: **FAIL** if any HIGH severity violation is detected, **PASS** otherwise.
 
 ```mermaid
 flowchart TD
@@ -56,19 +56,23 @@ flowchart TD
     D --> F[evaluator.py\nevaluate]
     E --> F
 
-    F --> G[Build message\nimage bytes + prompt]
-    G --> H[(Ollama Vision\nllava)]
+    F --> G1[Call 1: Violations prompt]
+    G1 --> H[(Ollama Vision\nllava)]
+    H --> I1[violations + confidence scores]
 
-    H --> I[Parse JSON response]
+    F --> G2[Call 2: UX + Audience prompt]
+    G2 --> H
+    H --> I2[ux_score + audience flags]
 
-    I --> J{Any HIGH\nviolation?}
+    I1 --> J{Any HIGH\nviolation?}
+    I2 --> J
     J -->|Yes| K[Verdict: FAIL]
     J -->|No| L[Verdict: PASS]
 
     K --> M[Rich CLI report]
     L --> M
 
-    M --> N[Violations table\nSeverity + evidence]
+    M --> N[Violations table\nSeverity + confidence + evidence]
     M --> O[UX score 1–10\nStrengths & weaknesses]
     M --> P[Audience suitability\nUnder 13 / 13–17 / 18+ / All Ages]
 ```
@@ -113,7 +117,7 @@ python main.py --image https://example.com/ad.png
 ## Output
 
 A Rich CLI report showing:
-- A violations table with severity, detection status, and evidence
-- UX score with qualitative notes
-- Audience suitability breakdown per age group
-- An overall PASS / FAIL verdict
+- A violations table with severity, detection status, confidence score, and evidence
+- UX score (1–10) with qualitative notes on strengths and weaknesses
+- Audience suitability breakdown per age group with a targeting suggestion
+- An overall PASS / FAIL verdict with a count of high-severity violations
