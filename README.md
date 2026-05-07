@@ -43,7 +43,7 @@ Classifies the image as appropriate or not for: Under 13 / 13–17 / 18+ / All A
 
 ## How it works
 
-Two focused model calls are made per image — one for policy violations, one for UX and audience. Keeping them separate gives the model a narrower task each time and produces more accurate results. The overall verdict is computed from the violations result: **FAIL** if any HIGH severity violation is detected, **PASS** otherwise.
+Two focused model calls are made per image — one for policy violations, one for UX and audience. Keeping them separate gives the model a narrower task each time, which reduces context overload and improves accuracy on both areas. When a single prompt asks the model to check compliance, score UX, and classify audience simultaneously, it tends to trade off precision across all three. Splitting the calls lets each prompt do one thing well. The overall verdict is computed from the violations result: **FAIL** if any HIGH severity violation is detected, **PASS** otherwise.
 
 ```mermaid
 flowchart TD
