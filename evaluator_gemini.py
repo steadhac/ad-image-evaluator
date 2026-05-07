@@ -10,9 +10,9 @@ Setup:
 Flow:
     1. Load and resize the image (path or URL → PIL Image)
     2. Configure the Gemini client with the API key
-    3. Send the image + prompt to the model
-    4. Strip any markdown fences from the raw response text
-    5. Extract the JSON object and parse it
+    3. Make two model calls — one for violations, one for UX and audience
+    4. Strip markdown fences, extract and parse JSON from each response
+    5. Merge results, compute verdict from HIGH_RISK violations
     6. Return the structured result dict (or an error dict on failure)
 """
 import io
@@ -25,50 +25,33 @@ import google.generativeai as genai
 import requests
 from PIL import Image
 
-from policies import VIOLATIONS
+from policies import VIOLATIONS, HIGH_RISK
 
-# Step 1 — Choose the model.
 # gemini-2.0-flash is the recommended free-tier model: fast, multimodal, handles images well.
 MODEL = "gemini-2.0-flash"
 
-# Step 2 — Build the violation list from policies.py so the prompt stays in sync
+# Build the violation list from policies.py so the prompt stays in sync
 # with any policy changes automatically.
 VIOLATION_LIST = "\n".join(
     f'- {v["id"]}: {v["description"]}' for v in VIOLATIONS
 )
 
-# Step 3 — Define the evaluation prompt.
-# The same structured prompt used by the Ollama evaluator, formatted for Gemini.
-# Gemini accepts the prompt as a plain string alongside the image object.
-PROMPT = f"""You are a Search Ads policy compliance expert and UX evaluator.
+# --- Prompt 1: Policy violations ---
+# Focused solely on detecting violations. Keeping this separate from the UX
+# prompt gives the model a narrower task and produces more accurate results.
+# Each violation returns a confidence score (0.0–1.0) so callers can filter
+# by certainty rather than treating all detections equally.
+PROMPT_VIOLATIONS = f"""You are a Search Ads policy compliance expert.
 
-Analyze the provided ad image and return a structured evaluation across three areas.
+Analyze the provided ad image for policy violations.
 
----
-
-PART 1 — POLICY VIOLATIONS
 Check for each of the following violations:
 {VIOLATION_LIST}
 
-For each violation, report whether it was detected and provide a one-sentence justification.
-
-PART 2 — UX SCORE
-Rate the overall user experience of the ad image on a scale of 1–10, considering:
-- Visual clarity and composition
-- Message legibility
-- Use of space
-- Overall ad effectiveness
-
-PART 3 — AUDIENCE SUITABILITY
-Classify the image content for the following age groups and indicate whether it is appropriate for each:
-- under_13
-- 13_to_17
-- 18_plus
-- all_ages
-
-Also suggest the most appropriate target audience based on the visual content and tone.
-
----
+For each violation return:
+- detected: true if the violation is present, false otherwise
+- confidence: a float from 0.0 to 1.0 representing how certain you are
+- evidence: one sentence explaining what you saw
 
 Reply with JSON only — no other text:
 {{
@@ -76,25 +59,51 @@ Reply with JSON only — no other text:
     {{
       "id": "<violation id>",
       "detected": <true|false>,
+      "confidence": <float 0.0-1.0>,
       "evidence": "<one sentence>"
     }}
-  ],
+  ]
+}}"""
+
+# --- Prompt 2: UX and audience ---
+# Separated from violations so the model focuses purely on quality and
+# audience fit, without being distracted by compliance checking.
+PROMPT_UX = """You are a UX evaluator for Search Ad images.
+
+Analyze the provided ad image across two areas.
+
+PART 1 — UX SCORE
+Rate the overall user experience on a scale of 1–10, considering:
+- Visual clarity and composition
+- Message legibility
+- Use of space
+- Overall ad effectiveness
+
+PART 2 — AUDIENCE SUITABILITY
+Classify whether the image is appropriate for each age group:
+- under_13
+- 13_to_17
+- 18_plus
+- all_ages
+
+Also suggest the most appropriate target audience based on the visual content and tone.
+
+Reply with JSON only — no other text:
+{
   "ux_score": <float 1.0-10.0>,
   "ux_notes": "<two to three sentences on strengths and weaknesses>",
-  "audience": {{
+  "audience": {
     "under_13": <true|false>,
     "13_to_17": <true|false>,
     "18_plus": <true|false>,
     "all_ages": <true|false>,
     "recommended_targeting": "<one sentence>"
-  }},
-  "overall_verdict": "<PASS|FAIL>"
-}}
+  }
+}"""
 
-Set overall_verdict to FAIL if any HIGH severity violation is detected, otherwise PASS."""
-
-# Step 4 — Maximum image dimension before sending to the model.
-# Resizing keeps memory usage low and speeds up the API call.
+# Images larger than this are resized before sending to the model.
+# 768px is enough for the model to read text and assess composition,
+# and keeps API payload size low.
 MAX_PX = 768
 
 
@@ -106,11 +115,10 @@ def _load_image(source: str) -> Image.Image:
 
     Steps:
         a. Fetch bytes from URL (with content-type check) or open a local file.
-        b. Reject PDFs early with a clear error — PIL cannot open them.
+        b. Reject PDFs early — PIL cannot open them.
         c. Resize to fit within MAX_PX × MAX_PX while preserving aspect ratio.
         d. Convert to RGB to strip alpha channels (e.g. PNGs with transparency).
     """
-    # Step a — Load from URL or local file
     if source.startswith("http://") or source.startswith("https://"):
         response = requests.get(source, timeout=10)
         response.raise_for_status()
@@ -124,27 +132,49 @@ def _load_image(source: str) -> Image.Image:
         img = Image.open(io.BytesIO(response.content))
     else:
         path = Path(source)
-        # Step b — Reject PDFs; PIL would raise an unhelpful error otherwise
         if path.suffix.lower() == ".pdf":
             raise ValueError("PDF files are not supported. Please provide a JPG, PNG, GIF, or WEBP image.")
         img = Image.open(path)
 
-    # Steps c & d — Resize and normalize color mode
     img.thumbnail((MAX_PX, MAX_PX), Image.LANCZOS)
     return img.convert("RGB")
+
+
+def _call(model, prompt: str, image: Image.Image):
+    """Send one prompt + image to Gemini and return parsed JSON, or None on failure.
+
+    Gemini's API accepts a list where each element is either a text string
+    or a PIL Image — both are passed together in a single generate_content call.
+    """
+    response = model.generate_content([prompt, image])
+
+    # Strip markdown fences (```json ... ```) that Gemini sometimes adds.
+    raw = re.sub(r"```(?:json)?\s*|\s*```", "", response.text.strip())
+
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        return json.loads(match.group())
+    except json.JSONDecodeError:
+        return None
 
 
 def evaluate(source: str, api_key: str | None = None) -> dict:
     """Evaluate an ad image using Gemini. Returns violations, UX score, audience suitability, and verdict.
 
+    Makes two sequential model calls (violations, then UX/audience), merges
+    the results, and computes the overall verdict based on HIGH severity hits.
+
     Steps:
         1. Resolve the API key (argument → env var → error).
         2. Configure the Gemini SDK and instantiate the model.
         3. Load and resize the image.
-        4. Send [prompt, image] to the model and get the raw text response.
-        5. Strip markdown code fences that the model sometimes wraps around JSON.
-        6. Extract the JSON object with a regex and parse it.
-        7. Return the parsed dict, or an error dict if parsing fails.
+        4. Call 1 — violations prompt → violations list with confidence scores.
+        5. Call 2 — UX prompt → ux_score, ux_notes, audience flags.
+        6. Merge results and compute verdict from policies.HIGH_RISK.
+        7. Return the merged dict, or an error dict if either call fails.
     """
     # Step 1 — Resolve API key
     key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -161,32 +191,33 @@ def evaluate(source: str, api_key: str | None = None) -> dict:
     # Step 3 — Load and resize the image
     image = _load_image(source)
 
-    # Step 4 — Call the model.
-    # Gemini's multimodal API accepts a list where each element is either
-    # a text string or a PIL Image. The model sees both together.
-    response = model.generate_content([PROMPT, image])
+    # Step 4 — Call 1: violations
+    violations_data = _call(model, PROMPT_VIOLATIONS, image)
+    if violations_data is None:
+        return _error_result("Violations call returned unparsable response.")
 
-    # Step 5 — Strip markdown fences (```json ... ```) that Gemini sometimes adds
-    raw = response.text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
+    # Step 5 — Call 2: UX and audience
+    ux_data = _call(model, PROMPT_UX, image)
+    if ux_data is None:
+        return _error_result("UX call returned unparsable response.")
 
-    # Step 6 — Extract the first {...} block and parse it as JSON
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        return _error_result(f"Model returned unparseable response: {raw[:200]}")
+    # Step 6 — Compute verdict from HIGH_RISK set rather than trusting the model
+    violations = violations_data.get("violations", [])
+    detected_ids = {v["id"] for v in violations if v.get("detected")}
+    verdict = "FAIL" if detected_ids & HIGH_RISK else "PASS"
 
-    try:
-        result = json.loads(match.group())
-    except json.JSONDecodeError as e:
-        return _error_result(f"Model returned invalid JSON ({e}): {match.group()[:200]}")
-
-    # Step 7 — Return the structured result
-    return result
+    # Step 7 — Return merged result
+    return {
+        "violations": violations,
+        "ux_score": ux_data.get("ux_score"),
+        "ux_notes": ux_data.get("ux_notes", ""),
+        "audience": ux_data.get("audience", {}),
+        "overall_verdict": verdict,
+    }
 
 
 def _error_result(reason: str) -> dict:
-    """Return a safe error dict that callers and display_results() can handle gracefully."""
+    """Return a safe fallback dict when a model call fails."""
     return {
         "violations": [],
         "ux_score": None,
